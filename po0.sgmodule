@@ -1,0 +1,16 @@
+#!name=Po0 流量面板
+#!desc=显示 Po0 服务器的上行 / 下行 / 剩余流量；切换网络时可自动把当前网段加入防火墙白名单
+#!category=Po0
+#!arguments=USER:必填,PASS:必填,SID:4040,NAME:Po0 腾讯云广州,FW_TOKEN:选填,AUTO_FW:1,FW_NOTIFY:1,INTERVAL:1800
+#!arguments-desc=USER / PASS：po0.io 登录邮箱与密码\nSID：服务编号（产品详情页的 #xxxx）\nNAME：面板标题\nFW_TOKEN：防火墙“添加网段链接”里 pgnfw_ 开头的那一段，不填则不自动加白名单\nAUTO_FW：1 = 切换网络时自动加入白名单，0 = 关闭\nFW_NOTIFY：1 = 加白名单成功时通知，0 = 只在失败时通知\nINTERVAL：面板自动刷新间隔（秒）
+
+[Panel]
+Po0Traffic = script-name=po0-traffic,update-interval={{{INTERVAL}}}
+
+[Script]
+po0-traffic = type=generic,timeout=40,script-path=https://raw.githubusercontent.com/halo798/surge-po0/main/po0.js,argument="mode=panel&sid={{{SID}}}&name={{{NAME}}}&user={{{USER}}}&pass={{{PASS}}}"
+po0-firewall = type=event,event-name=network-changed,timeout=60,script-path=https://raw.githubusercontent.com/halo798/surge-po0/main/po0.js,argument="mode=firewall&enable={{{AUTO_FW}}}&notify={{{FW_NOTIFY}}}&token={{{FW_TOKEN}}}"
+
+[Rule]
+# 防火墙接口必须直连，才能把手机真实出口 IP 加入白名单
+IP-CIDR,124.221.69.228/32,DIRECT,no-resolve
