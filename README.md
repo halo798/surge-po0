@@ -18,7 +18,7 @@ https://raw.githubusercontent.com/halo798/surge-po0/main/po0.sgmodule
 | `USER` / `PASS` | po0.io 登录邮箱和密码（必填） |
 | `SID` | 服务编号，产品详情页上的 `#xxxx` |
 | `NAME` | 面板标题 |
-| `FW_TOKEN` | 产品详情页“防火墙 → 复制添加网段链接”中 `pgnfw_` 开头的那一段；不填则不自动加白名单 |
+| `FW_TOKEN` | 产品详情页“防火墙 → 复制添加网段链接”中 `pgnfw_` 开头的那一段；不填则不自动加白名单。可加 `@序号` 锁定白名单位置，见下文 |
 | `AUTO_FW` | `1` 切换网络时自动加白名单，`0` 关闭 |
 | `FW_NOTIFY` | `1` 成功也通知，`0` 只在失败时通知 |
 | `INTERVAL` | 面板自动刷新间隔（秒） |
@@ -31,4 +31,20 @@ https://raw.githubusercontent.com/halo798/surge-po0/main/po0.sgmodule
   `/modules/servers/penguin/api/productInfo.php?serviceId=<SID>`，读取
   `txTransfer` / `rxTransfer` / `remainingTransfer` / `totalTransfer`（单位 KB）。
 - WHMCS 会话绑定 IP，换网络后会自动重新登录；获取失败时面板显示上一次的缓存数据。
-- 防火墙请求强制走 `DIRECT`，保证加入白名单的是手机真实出口 IP。白名单最多 5 条，新网段会顶掉最旧的一条。
+- 防火墙请求（`POST /api/firewall/<token>/add`）强制走 `DIRECT`，保证加入白名单的是手机真实出口 IP。白名单最多 5 条，不锁定位置时新网段会顶掉最旧的一条。
+
+## 锁定白名单位置（@序号）
+
+`FW_TOKEN` 后加 `@序号`，就把当前网段钉在白名单的固定位置，永不参与淘汰：
+
+| 填写 | 含义 |
+| --- | --- |
+| `pgnfw_xxx` | 不锁定，白名单满时按写入时间淘汰最旧的 |
+| `pgnfw_xxx@0` | 锁定白名单第 1 个位置 |
+| `pgnfw_xxx@1` | 锁定白名单第 2 个位置 |
+| `pgnfw_xxx@4` | 锁定白名单第 5 个位置（白名单共 5 个位置，序号 0–4） |
+
+- 脚本请求 `.../add?slot=序号`；该位置原有的网段会被替换成当前网段。
+- 同一网段只能占一个位置。如果当前网段已经锁在别的位置，接口会返回 403，通知会提示“请先在控制台防火墙里删除旧记录”，删掉后下次切换网络自动重试。
+- 多台 po0 机器用英文逗号分隔，可混用：`pgnfw_A@0,pgnfw_B`。
+- 建议只给家宽等固定出口锁定位置；手机在蜂窝 / 不同 Wi-Fi 之间切换时，锁定会让每次切网都替换掉该位置上的旧网段。
