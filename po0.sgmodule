@@ -6,10 +6,12 @@
 
 [Panel]
 Po0Traffic = script-name=po0-traffic,update-interval={{{INTERVAL}}}
+Po0Firewall = script-name=po0-firewall-panel,update-interval=600
 
 [Script]
-po0-traffic = type=generic,timeout=40,script-path=https://raw.githubusercontent.com/halo798/surge-po0/main/po0.js,argument="mode=panel&sid={{{SID}}}&name={{{NAME}}}&user={{{USER}}}&pass={{{PASS}}}"
-po0-firewall = type=event,event-name=network-changed,timeout=60,script-path=https://raw.githubusercontent.com/halo798/surge-po0/main/po0.js,argument="mode=firewall&enable={{{AUTO_FW}}}&notify={{{FW_NOTIFY}}}&token={{{FW_TOKEN}}}"
+po0-traffic = type=generic,timeout=40,script-path=https://raw.githubusercontent.com/halo798/surge-po0/main/po0.js?v=2026.11.14-2,argument="mode=panel&sid={{{SID}}}&name={{{NAME}}}&user={{{USER}}}&pass={{{PASS}}}"
+po0-firewall = type=event,event-name=network-changed,timeout=60,script-path=https://raw.githubusercontent.com/halo798/surge-po0/main/po0.js?v=2026.11.14-2,argument="mode=firewall&enable={{{AUTO_FW}}}&notify={{{FW_NOTIFY}}}&token={{{FW_TOKEN}}}"
+po0-firewall-panel = type=generic,timeout=40,script-path=https://raw.githubusercontent.com/halo798/surge-po0/main/po0.js?v=2026.11.14-2,argument="mode=firewall&panel=1&token={{{FW_TOKEN}}}"
 
 [Rule]
 # 防火墙接口必须直连，才能把手机真实出口 IP 加入白名单
