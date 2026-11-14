@@ -18,6 +18,9 @@ const KEY_COOKIE = 'po0_cookie';
 const KEY_CACHE = 'po0_cache';
 const KEY_FW_LAST = 'po0_fw_last';
 
+// 版本号：通知 / 面板 / 日志里都会显示，用来确认 Surge 跑的是不是最新脚本
+const FW_VER = '2026.11.14-2';
+
 const args = parseArgs(typeof $argument !== 'undefined' ? $argument : '');
 const MODE = args.mode || 'panel';
 
@@ -186,35 +189,56 @@ async function fetchInfo(sid, jar) {
 /* 防火墙：切换网络时加入白名单                                          */
 /* ------------------------------------------------------------------ */
 
+// panel=1：首页“Po0 防火墙”面板，点一下立即加白并显示结果（不防抖、不等待）
+// 否则为 network-changed 事件：切换网络后自动加白，用通知报告结果
 async function runFirewall() {
+  const panel = args.panel === '1';
   const enabled = !/^(0|false|off|no)$/i.test(args.enable || '1');
   const quiet = /^(0|false|off|no)$/i.test(args.notify || '1');
+  const out = (title, lines, ok) => {
+    const content = lines.concat('脚本 ' + FW_VER + ' · ' + hhmm(new Date())).join('\n');
+    console.log('[Po0 FW] ' + title + '\n' + content);
+    return panel
+      ? $done({
+          title: title,
+          content: content,
+          icon: ok ? 'checkmark.shield.fill' : 'exclamationmark.shield.fill',
+          'icon-color': ok ? '#34C759' : '#FF3B30',
+        })
+      : $done();
+  };
 
-  if (!enabled || !args.token) return $done();
+  if (!args.token) {
+    if (panel) return out('Po0 防火墙 · 未配置', ['模块参数 FW_TOKEN 未填写'], false);
+    return $done();
+  }
+  if (!enabled && !panel) return $done();
 
   const parsed = parseFwTokens(args.token);
   if (!parsed.items.length) {
-    if (parsed.bad.length) notify('Po0 防火墙', 'FW_TOKEN 格式错误', '应为 pgnfw_xxx 或 pgnfw_xxx@0：' + parsed.bad.join('、'), 0);
-    return $done();
+    const msg = '应为 pgnfw_xxx 或 pgnfw_xxx@0，收到：' + parsed.bad.join('、');
+    if (!panel) notify('Po0 防火墙', 'FW_TOKEN 格式错误', msg, 0);
+    return out('Po0 防火墙 · 格式错误', [msg], false);
   }
 
-  // 防抖：网络抖动时短时间内会连续触发
-  const now = Date.now();
-  const last = parseInt($persistentStore.read(KEY_FW_LAST) || '0', 10);
-  if (now - last < 15000) return $done();
-  $persistentStore.write(String(now), KEY_FW_LAST);
+  if (!panel) {
+    // 防抖：网络抖动时短时间内会连续触发
+    const now = Date.now();
+    const last = parseInt($persistentStore.read(KEY_FW_LAST) || '0', 10);
+    if (now - last < 15000) return $done();
+    $persistentStore.write(String(now), KEY_FW_LAST);
 
-  // 断网时不请求
-  if (typeof $network !== 'undefined' && $network) {
-    const v4 = $network.v4 && $network.v4.primaryAddress;
-    const v6 = $network.v6 && $network.v6.primaryAddress;
-    if (!v4 && !v6) return $done();
+    // 断网时不请求
+    if (typeof $network !== 'undefined' && $network) {
+      const v4 = $network.v4 && $network.v4.primaryAddress;
+      const v6 = $network.v6 && $network.v6.primaryAddress;
+      if (!v4 && !v6) return $done();
+    }
+    await sleep(2500); // 等新网络稳定
   }
 
   const netName =
     (typeof $network !== 'undefined' && $network && $network.wifi && $network.wifi.ssid) || '蜂窝网络';
-
-  await sleep(2500); // 等新网络稳定
 
   const results = await Promise.all(parsed.items.map((it) => fwAdd(it.token, it.slot)));
 
@@ -230,11 +254,13 @@ async function runFirewall() {
   parsed.bad.forEach((b) => errLines.push('格式错误，已跳过：' + b));
 
   if (errLines.length) {
-    notify('Po0 防火墙', '加入白名单失败（' + netName + '）', errLines.concat(okLines).join('\n'), 0);
-  } else if (!quiet) {
+    if (!panel) notify('Po0 防火墙', '加入白名单失败（' + netName + '）', errLines.concat(okLines, '脚本 ' + FW_VER).join('\n'), 0);
+    return out('Po0 防火墙 · 失败（' + netName + '）', errLines.concat(okLines), false);
+  }
+  if (!panel && !quiet) {
     notify('Po0 防火墙', '已放行当前网段（' + netName + '）', okLines.join('\n'), 4);
   }
-  $done();
+  return out('Po0 防火墙 · 已放行（' + netName + '）', okLines, true);
 }
 
 /**
@@ -247,13 +273,16 @@ function parseFwTokens(raw) {
   const items = [];
   const bad = [];
   String(raw)
+    .replace(/^["']|["']$/g, '')
     .split(/[,，|;；\s]+/)
     .map((s) => s.trim())
     .filter(Boolean)
     .forEach((s) => {
-      const m = s.match(/^(pgnfw_[A-Za-z0-9_-]+)(?:@(\d+))?$/);
-      if (!m) return bad.push(s.length > 14 ? s.slice(0, 10) + '…' : s);
-      items.push({ token: m[1], slot: m[2] == null ? null : parseInt(m[2], 10) });
+      // 兼容直接粘贴整条“添加网段链接”：https://…/api/firewall/pgnfw_xxx/add@0
+      const m = s.match(/pgnfw_[A-Za-z0-9]+/);
+      const n = s.match(/@\s*(\d+)\s*$/) || s.match(/[?&]slot=(\d+)/);
+      if (!m || (/@/.test(s) && !n)) return bad.push(s.length > 14 ? s.slice(0, 10) + '…' : s);
+      items.push({ token: m[0], slot: n ? parseInt(n[1], 10) : null });
     });
   return { items: items, bad: bad };
 }
@@ -305,6 +334,10 @@ async function fwAdd(token, slot) {
       if (r.status >= 200 && r.status < 300) {
         if (!data) return { ok: true, text: summarize(r.body) || '已提交' };
         return describeFw(data, slot);
+      }
+      if (r.status >= 300 && r.status < 400) {
+        // 路径里的 token 不合法时，服务端会 302 跳转到控制台首页
+        return { ok: false, text: 'token 无效（HTTP ' + r.status + ' 跳转到控制台），请重新复制 pgnfw_ 开头那段' };
       }
       lastErr = 'HTTP ' + r.status + ' ' + summarize(r.body);
       // 规范 JSON 错误（如 token 无效）重试无意义；裸 “Error” / 5xx 属于服务端偶发，重试
