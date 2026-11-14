@@ -3,6 +3,7 @@
  *
  * mode=panel    : 登录 console.po0.io，读取 productInfo.php，显示 上行 / 下行 / 剩余流量
  * mode=firewall : 网络切换时请求防火墙 add 链接，把当前出口 /24 网段加入白名单
+ *                 FW_TOKEN 写成 pgnfw_xxx@N 时锁定白名单第 N+1 个位置（@0 = 第 1 个）
  *
  * 数据来源：/modules/servers/penguin/api/productInfo.php?serviceId=<id>
  *   totalTransfer / usedTransfer / remainingTransfer / txTransfer / rxTransfer，单位 KB
@@ -186,11 +187,16 @@ async function fetchInfo(sid, jar) {
 /* ------------------------------------------------------------------ */
 
 async function runFirewall() {
-  const token = args.token;
   const enabled = !/^(0|false|off|no)$/i.test(args.enable || '1');
   const quiet = /^(0|false|off|no)$/i.test(args.notify || '1');
 
-  if (!enabled || !token) return $done();
+  if (!enabled || !args.token) return $done();
+
+  const parsed = parseFwTokens(args.token);
+  if (!parsed.items.length) {
+    if (parsed.bad.length) notify('Po0 防火墙', 'FW_TOKEN 格式错误', '应为 pgnfw_xxx 或 pgnfw_xxx@0：' + parsed.bad.join('、'), 0);
+    return $done();
+  }
 
   // 防抖：网络抖动时短时间内会连续触发
   const now = Date.now();
@@ -210,36 +216,132 @@ async function runFirewall() {
 
   await sleep(2500); // 等新网络稳定
 
-  const url = FW_BASE + '/' + token + '/add';
-  let lastErr = null;
+  const results = await Promise.all(parsed.items.map((it) => fwAdd(it.token, it.slot)));
 
+  const multi = parsed.items.length > 1;
+  const okLines = [];
+  const errLines = [];
+  results.forEach((r, i) => {
+    const it = parsed.items[i];
+    const no = multi ? '#' + (i + 1) + ' ' : '';
+    if (r.ok) okLines.push(no + r.text);
+    else errLines.push(no + slotLabel(it.slot) + '：' + r.text);
+  });
+  parsed.bad.forEach((b) => errLines.push('格式错误，已跳过：' + b));
+
+  if (errLines.length) {
+    notify('Po0 防火墙', '加入白名单失败（' + netName + '）', errLines.concat(okLines).join('\n'), 0);
+  } else if (!quiet) {
+    notify('Po0 防火墙', '已放行当前网段（' + netName + '）', okLines.join('\n'), 4);
+  }
+  $done();
+}
+
+/**
+ * 解析 FW_TOKEN：
+ *   pgnfw_xxx      → 不锁定位置，白名单满时按写入时间淘汰最旧的
+ *   pgnfw_xxx@0    → 锁定白名单第 1 个位置（@1 第 2 个，以此类推），永不被淘汰
+ *   多台机器用英文逗号分隔：pgnfw_A@0,pgnfw_B
+ */
+function parseFwTokens(raw) {
+  const items = [];
+  const bad = [];
+  String(raw)
+    .split(/[,，|;；\s]+/)
+    .map((s) => s.trim())
+    .filter(Boolean)
+    .forEach((s) => {
+      const m = s.match(/^(pgnfw_[A-Za-z0-9_-]+)(?:@(\d+))?$/);
+      if (!m) return bad.push(s.length > 14 ? s.slice(0, 10) + '…' : s);
+      items.push({ token: m[1], slot: m[2] == null ? null : parseInt(m[2], 10) });
+    });
+  return { items: items, bad: bad };
+}
+
+function slotLabel(slot) {
+  return slot == null ? '不锁定' : '锁定第 ' + (slot + 1) + ' 位（@' + slot + '）';
+}
+
+// POST /api/firewall/<token>/add[?slot=N]：把请求来源 /24 网段加入白名单。
+// 带 slot 时钉在该位置，永不参与淘汰；该位置原有网段会被替换。
+// 返回 {enabled, whitelist:[{ip, slot}], limit, currentIp}；403 = 本网段已锁在别的位置。
+async function fwAdd(token, slot) {
+  let url = FW_BASE + '/' + encodeURIComponent(token) + '/add';
+  if (slot != null) url += '?slot=' + slot;
+
+  let lastErr = '未知错误';
   for (let i = 0; i < 3; i++) {
     try {
+      const opts = {
+        url: url,
+        policy: 'DIRECT',
+        timeout: 10,
+        headers: baseHeaders({ Accept: 'application/json', 'Content-Type': 'application/json' }),
+        body: '',
+      };
       let r;
-      const opts = { url: url, policy: 'DIRECT', timeout: 10, headers: baseHeaders({ Accept: '*/*' }) };
       try {
-        r = await request('get', opts);
+        r = await request('post', opts);
       } catch (e) {
         // 若是 IP 证书校验失败，退回不校验证书再试一次
         if (!/certif|ssl|tls|trust/i.test(e.message)) throw e;
         opts.insecure = true;
-        r = await request('get', opts);
+        r = await request('post', opts);
       }
 
+      let data = null;
+      try {
+        data = JSON.parse(r.body);
+      } catch (e) {}
+
+      if (r.status === 403) {
+        return {
+          ok: false,
+          text:
+            '当前网段' + (data && data.currentIp ? ' ' + data.currentIp : '') +
+            ' 已锁定在其他位置，请先在控制台防火墙里删除旧记录',
+        };
+      }
       if (r.status >= 200 && r.status < 300) {
-        if (!quiet) notify('Po0 防火墙', '已放行当前网段（' + netName + '）', summarize(r.body), 4);
-        return $done();
+        if (!data) return { ok: true, text: summarize(r.body) || '已提交' };
+        return describeFw(data, slot);
       }
-      lastErr = new Error('HTTP ' + r.status + ' ' + summarize(r.body));
-      if (r.status >= 400 && r.status < 500) break; // token 失效等，重试无意义
+      lastErr = 'HTTP ' + r.status + ' ' + summarize(r.body);
+      // 规范 JSON 错误（如 token 无效）重试无意义；裸 “Error” / 5xx 属于服务端偶发，重试
+      if (r.status < 500 && data) break;
     } catch (e) {
-      lastErr = e;
+      lastErr = e.message;
     }
-    await sleep(3000);
+    await sleep(2000 * (i + 1));
   }
+  return { ok: false, text: lastErr };
+}
 
-  notify('Po0 防火墙', '加入白名单失败（' + netName + '）', lastErr ? lastErr.message : '未知错误', 0);
-  $done();
+function describeFw(data, slot) {
+  if (data.enabled === false) return { ok: false, text: '防火墙未启用' };
+  const cur = data.currentIp || '';
+  const list = (Array.isArray(data.whitelist) ? data.whitelist : []).map((e) =>
+    e && typeof e === 'object' ? e : { ip: e, slot: null }
+  );
+  const mine = list.find((e) => sameC24(e.ip, cur));
+  if (!mine) return { ok: false, text: '提交成功但白名单里没有当前网段 ' + cur };
+  if (slot != null && mine.slot != null && Number(mine.slot) !== slot) {
+    return { ok: false, text: '当前网段在第 ' + (Number(mine.slot) + 1) + ' 位，不是期望的第 ' + (slot + 1) + ' 位' };
+  }
+  const where = mine.slot != null ? '已锁定第 ' + (Number(mine.slot) + 1) + ' 位（@' + mine.slot + '）' : '未锁定位置';
+  return { ok: true, text: cur + ' · ' + where + ' · 白名单 ' + list.length + '/' + (data.limit || '?') };
+}
+
+// 服务端按 /24 加白：任一侧是 /24 段时比较前三段，否则要求完全相同
+function sameC24(a, b) {
+  if (!a || !b) return false;
+  a = String(a);
+  b = String(b);
+  if (a === b) return true;
+  if (!/\/24$/.test(a) && !/\/24$/.test(b)) return false;
+  const pa = a.replace('/24', '').split('.');
+  const pb = b.replace('/24', '').split('.');
+  return pa.length === 4 && pb.length === 4 && pa[0] === pb[0] && pa[1] === pb[1] && pa[2] === pb[2];
 }
 
 /* ------------------------------------------------------------------ */
