@@ -2,8 +2,8 @@
  * Po0 流量面板 + 防火墙自动白名单（Surge iOS）
  *
  * mode=panel    : 登录 console.po0.io，读取 productInfo.php，显示 上行 / 下行 / 剩余流量
- * mode=firewall : 网络切换时请求防火墙 add 链接，把当前出口 /24 网段加入白名单
- *                 FW_TOKEN 写成 pgnfw_xxx@N 时锁定白名单第 N+1 个位置（@0 = 第 1 个）
+ * mode=firewall : 切换网络时 / 每 10 分钟 / 点面板时，把当前出口 /24 网段加入防火墙白名单
+ *                 FW_TOKEN 不写 @ = 不锁定；写 @0–@4 = 锁定白名单第 1–5 个位置
  *
  * 数据来源：/modules/servers/penguin/api/productInfo.php?serviceId=<id>
  *   totalTransfer / usedTransfer / remainingTransfer / txTransfer / rxTransfer，单位 KB
@@ -16,10 +16,12 @@ const UA =
 
 const KEY_COOKIE = 'po0_cookie';
 const KEY_CACHE = 'po0_cache';
-const KEY_FW_LAST = 'po0_fw_last';
+const KEY_FW_LAST = 'po0_fw_last'; // 切网事件防抖
+const KEY_FW_SRC = 'po0_fw_src'; // 本机加白过的网段来自蜂窝还是 Wi-Fi
+const KEY_FW_STATE = 'po0_fw_state'; // 上次加白结果，定时任务只在变化时通知
 
 // 版本号：通知 / 面板 / 日志里都会显示，用来确认 Surge 跑的是不是最新脚本
-const FW_VER = '2026.11.14-2';
+const FW_VER = '2026.11.16-3';
 
 const args = parseArgs(typeof $argument !== 'undefined' ? $argument : '');
 const MODE = args.mode || 'panel';
@@ -186,120 +188,193 @@ async function fetchInfo(sid, jar) {
 }
 
 /* ------------------------------------------------------------------ */
-/* 防火墙：切换网络时加入白名单                                          */
+/* 防火墙：自动把当前网段加入白名单                                      */
 /* ------------------------------------------------------------------ */
 
-// panel=1：首页“Po0 防火墙”面板，点一下立即加白并显示结果（不防抖、不等待）
-// 否则为 network-changed 事件：切换网络后自动加白，用通知报告结果
+// 触发方式：
+//   panel=1  首页“Po0 防火墙”面板：点一下（或面板自动刷新）立即加白，并显示白名单
+//   cron=1   每 10 分钟兜底：抓“没切网但出口 IP 变了”的情况，结果有变化才通知
+//   其余     network-changed 事件：切换网络后自动加白
 async function runFirewall() {
   const panel = args.panel === '1';
+  const cron = args.cron === '1';
   const enabled = !/^(0|false|off|no)$/i.test(args.enable || '1');
-  const quiet = /^(0|false|off|no)$/i.test(args.notify || '1');
-  const out = (title, lines, ok) => {
-    const content = lines.concat('脚本 ' + FW_VER + ' · ' + hhmm(new Date())).join('\n');
-    console.log('[Po0 FW] ' + title + '\n' + content);
-    return panel
-      ? $done({
-          title: title,
-          content: content,
-          icon: ok ? 'checkmark.shield.fill' : 'exclamationmark.shield.fill',
-          'icon-color': ok ? '#34C759' : '#FF3B30',
-        })
-      : $done();
-  };
+  const notifyOk = !/^(0|false|off|no)$/i.test(args.notify || '1');
 
-  if (!args.token) {
-    if (panel) return out('Po0 防火墙 · 未配置', ['模块参数 FW_TOKEN 未填写'], false);
-    return $done();
-  }
-  if (!enabled && !panel) return $done();
+  if (!panel && !enabled) return $done();
 
-  const parsed = parseFwTokens(args.token);
+  const net = netInfo();
+  const parsed = parseFwTokens(args.token || '');
+
   if (!parsed.items.length) {
-    const msg = '应为 pgnfw_xxx 或 pgnfw_xxx@0，收到：' + parsed.bad.join('、');
-    if (!panel) notify('Po0 防火墙', 'FW_TOKEN 格式错误', msg, 0);
-    return out('Po0 防火墙 · 格式错误', [msg], false);
+    const msg = args.token ? parsed.errors.join('\n') : '模块参数 FW_TOKEN 未填写';
+    if (!panel && args.token) fwNotify('❌ FW_TOKEN 填写有误', msg, cron, 'parse|' + msg, true);
+    return fwFinish(panel, false, args.token ? '填写有误' : '未配置', [msg]);
   }
 
-  if (!panel) {
+  if (!panel && !cron) {
     // 防抖：网络抖动时短时间内会连续触发
     const now = Date.now();
     const last = parseInt($persistentStore.read(KEY_FW_LAST) || '0', 10);
     if (now - last < 15000) return $done();
     $persistentStore.write(String(now), KEY_FW_LAST);
-
     // 断网时不请求
-    if (typeof $network !== 'undefined' && $network) {
-      const v4 = $network.v4 && $network.v4.primaryAddress;
-      const v6 = $network.v6 && $network.v6.primaryAddress;
-      if (!v4 && !v6) return $done();
-    }
+    if (!net.online) return $done();
     await sleep(2500); // 等新网络稳定
   }
 
-  const netName =
-    (typeof $network !== 'undefined' && $network && $network.wifi && $network.wifi.ssid) || '蜂窝网络';
-
   const results = await Promise.all(parsed.items.map((it) => fwAdd(it.token, it.slot)));
 
+  // 记下本机加白的网段来自蜂窝还是 Wi-Fi，面板据此显示 📶 / 🛜
+  const src = loadSrc();
+  results.forEach((r) => {
+    if (r.ok && r.view && r.view.cur) src[c24(r.view.cur)] = { t: net.type, s: net.ssid || '', ts: Date.now() };
+  });
+  saveJson(KEY_FW_SRC, src);
+
+  const allOk = results.every((r) => r.ok) && !parsed.errors.length;
+  const withView = results.find((r) => r.view && r.view.cur);
+  const cur = withView ? withView.view.cur : '';
   const multi = parsed.items.length > 1;
-  const okLines = [];
-  const errLines = [];
+
+  // 面板：当前网络 + 每台机器的白名单明细
+  const lines = ['当前 ' + net.emoji + ' ' + net.label + ' · 出口 ' + (cur || '未知')];
   results.forEach((r, i) => {
     const it = parsed.items[i];
-    const no = multi ? '#' + (i + 1) + ' ' : '';
-    if (r.ok) okLines.push(no + r.text);
-    else errLines.push(no + slotLabel(it.slot) + '：' + r.text);
+    const head = (multi ? '#' + (i + 1) + ' ' : '') + slotText(it.slot);
+    if (r.ok) {
+      lines.push('✅ ' + head + ' · 白名单 ' + r.view.list.length + '/' + r.view.limit);
+    } else {
+      lines.push('❌ ' + head + '：' + r.msg);
+    }
+    if (r.view) lines.push.apply(lines, listLines(r.view, src));
   });
-  parsed.bad.forEach((b) => errLines.push('格式错误，已跳过：' + b));
+  parsed.errors.forEach((e) => lines.push('❌ ' + e));
+  lines.push('📶蜂窝 🛜Wi-Fi ❔其他设备 📌锁定 ←当前');
 
-  if (errLines.length) {
-    if (!panel) notify('Po0 防火墙', '加入白名单失败（' + netName + '）', errLines.concat(okLines, '脚本 ' + FW_VER).join('\n'), 0);
-    return out('Po0 防火墙 · 失败（' + netName + '）', errLines.concat(okLines), false);
+  // 通知：只放结论，不放整张白名单
+  const brief = results.map((r, i) => {
+    const it = parsed.items[i];
+    const head = (multi ? '#' + (i + 1) + ' ' : '') + slotText(it.slot);
+    return r.ok ? '✅ ' + head + ' · ' + r.view.cur + ' · 白名单 ' + r.view.list.length + '/' + r.view.limit : '❌ ' + head + '：' + r.msg;
+  });
+  parsed.errors.forEach((e) => brief.push('❌ ' + e));
+
+  if (!panel) {
+    const state = cur + '|' + brief.join('|');
+    const sub = (allOk ? '✅ 已放行 ' : '❌ 加白失败 ') + net.emoji + ' ' + net.label;
+    fwNotify(sub, brief.join('\n'), cron, state, !allOk || notifyOk);
   }
-  if (!panel && !quiet) {
-    notify('Po0 防火墙', '已放行当前网段（' + netName + '）', okLines.join('\n'), 4);
+  return fwFinish(panel, allOk, allOk ? '已放行' : '加白失败', lines);
+}
+
+// 面板结束（事件 / 定时任务直接结束）
+function fwFinish(panel, ok, status, lines) {
+  const content = lines.concat('v' + FW_VER + ' · ' + hhmm(new Date())).join('\n');
+  console.log('[Po0 FW] ' + status + '\n' + content);
+  if (!panel) return $done();
+  $done({
+    title: 'Po0 防火墙 · ' + status,
+    content: content,
+    icon: ok ? 'checkmark.shield.fill' : 'exclamationmark.shield.fill',
+    'icon-color': ok ? '#34C759' : '#FF3B30',
+  });
+}
+
+// 每次都记录结果；定时任务只在结果变化时通知，避免每 10 分钟重复提醒同一件事
+function fwNotify(subtitle, body, cron, state, want) {
+  const prev = $persistentStore.read(KEY_FW_STATE);
+  $persistentStore.write(state, KEY_FW_STATE);
+  if (!want || (cron && prev === state)) return;
+  notify('Po0 防火墙', subtitle, body + '\nv' + FW_VER, 0);
+}
+
+function slotText(slot) {
+  return slot === null ? '不锁定' : '锁定 @' + slot;
+}
+
+// 白名单明细：锁定的按位置排在前面，其余按服务端顺序
+function listLines(view, src) {
+  const pinned = view.list.filter((e) => e.slot !== null).sort((a, b) => a.slot - b.slot);
+  const free = view.list.filter((e) => e.slot === null);
+  const rows = pinned.concat(free).map((e) => {
+    const s = src[c24(e.ip)];
+    const mark = !s ? '❔' : s.t === 'cell' ? '📶' : s.t === 'wifi' ? '🛜' + (s.s ? cut(s.s, 8) : '') : '🌐';
+    return '  ' + e.ip + ' ' + mark + (e.slot !== null ? ' 📌@' + e.slot : '') + (sameC24(e.ip, view.cur) ? ' ←' : '');
+  });
+  return rows.length ? rows : ['  （白名单为空）'];
+}
+
+// 当前网络：pdp_ip* = 蜂窝，en* / 有 SSID = Wi-Fi
+function netInfo() {
+  const n = typeof $network !== 'undefined' && $network ? $network : {};
+  const v4 = n.v4 || {};
+  const v6 = n.v6 || {};
+  const iface = v4.primaryInterface || v6.primaryInterface || '';
+  const ssid = (n.wifi && n.wifi.ssid) || '';
+  const online = !!(v4.primaryAddress || v6.primaryAddress) || typeof $network === 'undefined';
+  if (/^pdp_ip/.test(iface)) return { type: 'cell', emoji: '📶', label: '蜂窝', ssid: '', online: online };
+  if (ssid || /^en\d/.test(iface)) {
+    return { type: 'wifi', emoji: '🛜', label: 'Wi-Fi' + (ssid ? '「' + cut(ssid, 12) + '」' : ''), ssid: ssid, online: online };
   }
-  return out('Po0 防火墙 · 已放行（' + netName + '）', okLines, true);
+  return { type: 'other', emoji: '🌐', label: iface || '未知网络', ssid: '', online: online };
 }
 
 /**
- * 解析 FW_TOKEN：
- *   pgnfw_xxx      → 不锁定位置，白名单满时按写入时间淘汰最旧的
- *   pgnfw_xxx@0    → 锁定白名单第 1 个位置（@1 第 2 个，以此类推），永不被淘汰
- *   多台机器用英文逗号分隔：pgnfw_A@0,pgnfw_B
+ * 解析 FW_TOKEN（不写 @ = 不锁定；@0–@4 = 锁定白名单第 1–5 个位置）：
+ *   pgnfw_xxx            不锁定，白名单满时按写入时间淘汰最旧的
+ *   pgnfw_xxx@0          锁定第 1 个位置 …… pgnfw_xxx@4 锁定第 5 个位置
+ *   pgnfw_A@0,pgnfw_B    多台机器用英文逗号分隔
+ * 也兼容直接粘贴控制台“复制添加脚本”的整段内容或整条链接、全角 ＠ 和数字。
+ * token 只含字母、数字、下划线（服务端只认这些字符）。
  */
 function parseFwTokens(raw) {
+  const s = toHalfWidth(String(raw));
+  const re = /pgnfw_[A-Za-z0-9_]+/g;
+  const found = [];
+  let m;
+  while ((m = re.exec(s))) found.push({ token: m[0], start: m.index, end: m.index + m[0].length });
+
   const items = [];
-  const bad = [];
-  String(raw)
-    .replace(/^["']|["']$/g, '')
-    .split(/[,，|;；\s]+/)
-    .map((s) => s.trim())
-    .filter(Boolean)
-    .forEach((s) => {
-      // 兼容直接粘贴整条“添加网段链接”：https://…/api/firewall/pgnfw_xxx/add@0
-      const m = s.match(/pgnfw_[A-Za-z0-9]+/);
-      const n = s.match(/@\s*(\d+)\s*$/) || s.match(/[?&]slot=(\d+)/);
-      if (!m || (/@/.test(s) && !n)) return bad.push(s.length > 14 ? s.slice(0, 10) + '…' : s);
-      items.push({ token: m[0], slot: n ? parseInt(n[1], 10) : null });
-    });
-  return { items: items, bad: bad };
+  const errors = [];
+  if (!found.length) {
+    if (s.trim()) errors.push('没找到 pgnfw_ 开头的 token（收到：' + cut(s.trim(), 16) + '）');
+    return { items: items, errors: errors };
+  }
+  found.forEach((f, i) => {
+    // token 后面到下一个分隔符为止，找 @N 或 ?slot=N
+    const tail = s.slice(f.end, i + 1 < found.length ? found[i + 1].start : s.length).split(/[,|;、]/)[0];
+    const at = tail.match(/@\s*([^\s/?&#"']*)/);
+    const q = tail.match(/[?&]slot=([^\s&#"']*)/);
+    const want = at ? at[1] : q ? q[1] : null;
+    let slot = null;
+    if (want !== null) {
+      if (!/^[0-4]$/.test(want)) {
+        errors.push(mask(f.token) + '@' + want + '：只能写 @0、@1、@2、@3、@4（不写 @ 表示不锁定），本条未提交');
+        return;
+      }
+      slot = parseInt(want, 10);
+    }
+    const dup = items.find((x) => x.token === f.token);
+    if (dup) {
+      if (slot !== null) dup.slot = slot;
+      return;
+    }
+    items.push({ token: f.token, slot: slot });
+  });
+  return { items: items, errors: errors };
 }
 
-function slotLabel(slot) {
-  return slot == null ? '不锁定' : '锁定第 ' + (slot + 1) + ' 位（@' + slot + '）';
-}
-
-// POST /api/firewall/<token>/add[?slot=N]：把请求来源 /24 网段加入白名单。
-// 带 slot 时钉在该位置，永不参与淘汰；该位置原有网段会被替换。
+// POST /api/firewall/<token>/add[?slot=N]：把请求来源的 /24 网段加入白名单。
+// 不带 slot = 不锁定（满了按写入时间淘汰最旧的）；带 slot = 钉在该位置，永不淘汰。
 // 返回 {enabled, whitelist:[{ip, slot}], limit, currentIp}；403 = 本网段已锁在别的位置。
 async function fwAdd(token, slot) {
-  let url = FW_BASE + '/' + encodeURIComponent(token) + '/add';
-  if (slot != null) url += '?slot=' + slot;
+  const url = FW_BASE + '/' + token + '/add' + (slot === null ? '' : '?slot=' + slot);
+  const tag = mask(token) + (slot === null ? '' : '@' + slot);
+  let last = { ok: false, msg: '未知错误' };
 
-  let lastErr = '未知错误';
   for (let i = 0; i < 3; i++) {
+    let r;
     try {
       const opts = {
         url: url,
@@ -308,7 +383,6 @@ async function fwAdd(token, slot) {
         headers: baseHeaders({ Accept: 'application/json', 'Content-Type': 'application/json' }),
         body: '',
       };
-      let r;
       try {
         r = await request('post', opts);
       } catch (e) {
@@ -317,52 +391,78 @@ async function fwAdd(token, slot) {
         opts.insecure = true;
         r = await request('post', opts);
       }
-
-      let data = null;
-      try {
-        data = JSON.parse(r.body);
-      } catch (e) {}
-
-      if (r.status === 403) {
-        return {
-          ok: false,
-          text:
-            '当前网段' + (data && data.currentIp ? ' ' + data.currentIp : '') +
-            ' 已锁定在其他位置，请先在控制台防火墙里删除旧记录',
-        };
-      }
-      if (r.status >= 200 && r.status < 300) {
-        if (!data) return { ok: true, text: summarize(r.body) || '已提交' };
-        return describeFw(data, slot);
-      }
-      if (r.status >= 300 && r.status < 400) {
-        // 路径里的 token 不合法时，服务端会 302 跳转到控制台首页
-        return { ok: false, text: 'token 无效（HTTP ' + r.status + ' 跳转到控制台），请重新复制 pgnfw_ 开头那段' };
-      }
-      lastErr = 'HTTP ' + r.status + ' ' + summarize(r.body);
-      // 规范 JSON 错误（如 token 无效）重试无意义；裸 “Error” / 5xx 属于服务端偶发，重试
-      if (r.status < 500 && data) break;
     } catch (e) {
-      lastErr = e.message;
+      console.log('[Po0 FW] ' + tag + ' 第 ' + (i + 1) + ' 次请求失败：' + e.message);
+      last = { ok: false, msg: '网络请求失败：' + e.message };
+      await sleep(2000 * (i + 1));
+      continue;
     }
+
+    console.log('[Po0 FW] ' + tag + ' HTTP ' + r.status + ' ' + String(r.body).slice(0, 400));
+    const res = judgeFw(r.status, r.body, slot);
+    if (res.ok || !res.retry) return res;
+    last = res;
     await sleep(2000 * (i + 1));
   }
-  return { ok: false, text: lastErr };
+  return last;
 }
 
-function describeFw(data, slot) {
-  if (data.enabled === false) return { ok: false, text: '防火墙未启用' };
-  const cur = data.currentIp || '';
-  const list = (Array.isArray(data.whitelist) ? data.whitelist : []).map((e) =>
-    e && typeof e === 'object' ? e : { ip: e, slot: null }
-  );
-  const mine = list.find((e) => sameC24(e.ip, cur));
-  if (!mine) return { ok: false, text: '提交成功但白名单里没有当前网段 ' + cur };
-  if (slot != null && mine.slot != null && Number(mine.slot) !== slot) {
-    return { ok: false, text: '当前网段在第 ' + (Number(mine.slot) + 1) + ' 位，不是期望的第 ' + (slot + 1) + ' 位' };
+function judgeFw(status, body, slot) {
+  let data = null;
+  try {
+    data = JSON.parse(body);
+  } catch (e) {}
+  const view = data && Array.isArray(data.whitelist) ? toView(data) : null;
+  const srv = data && (data.message || data.msg) ? String(data.message || data.msg) : '';
+  const mine = view ? view.list.find((e) => sameC24(e.ip, view.cur)) : null;
+
+  if (status >= 300 && status < 400) {
+    return { ok: false, msg: 'token 无效（HTTP ' + status + '），请到控制台「防火墙 → 复制添加脚本」重新复制 pgnfw_ 开头那段' };
   }
-  const where = mine.slot != null ? '已锁定第 ' + (Number(mine.slot) + 1) + ' 位（@' + mine.slot + '）' : '未锁定位置';
-  return { ok: true, text: cur + ' · ' + where + ' · 白名单 ' + list.length + '/' + (data.limit || '?') };
+  if (status === 403) {
+    const where = mine && mine.slot !== null ? '（现在在 @' + mine.slot + '）' : '';
+    return {
+      ok: false,
+      view: view,
+      msg: '当前网段已锁定在别的位置' + where + '，同一网段只能占一个位置：先在控制台防火墙里删掉旧记录' + (srv ? '（' + srv + '）' : ''),
+    };
+  }
+  if (status >= 200 && status < 300) {
+    if (!view) return { ok: false, retry: true, msg: '返回内容无法识别：' + summarize(body) };
+    if (view.enabled === false) return { ok: false, view: view, msg: '控制台里这台机器的防火墙没有开启' };
+    if (!mine) return { ok: false, view: view, msg: '提交成功，但白名单里没有当前网段 ' + view.cur };
+    if (slot !== null && mine.slot !== slot) {
+      return {
+        ok: false,
+        view: view,
+        msg: '当前网段在' + (mine.slot === null ? '未锁定位置' : ' @' + mine.slot) + '，不是 @' + slot + '：先在控制台删掉旧记录再试',
+      };
+    }
+    return { ok: true, view: view };
+  }
+  if (/serviceId is required|invalid token|token/i.test(srv)) {
+    return { ok: false, view: view, msg: 'token 无效（服务端：' + srv + '），请重新复制 pgnfw_ 开头那段' };
+  }
+  // 5xx 或裸 “Error” 属于服务端偶发，重试；规范 JSON 错误重试无意义
+  return { ok: false, view: view, retry: status >= 500 || !data, msg: 'HTTP ' + status + ' ' + (srv || summarize(body)) };
+}
+
+function toView(data) {
+  const slotOf = (v) => (v === null || v === undefined || v === '' || isNaN(Number(v)) ? null : Number(v));
+  return {
+    enabled: data.enabled,
+    limit: data.limit || 5,
+    cur: data.currentIp ? String(data.currentIp) : '',
+    list: data.whitelist.map((e) =>
+      e && typeof e === 'object' ? { ip: String(e.ip), slot: slotOf(e.slot) } : { ip: String(e), slot: null }
+    ),
+  };
+}
+
+// 统一成 x.x.x.0/24，作为“网段来源”记录的键
+function c24(ip) {
+  const p = String(ip).replace(/\/\d+$/, '').split('.');
+  return p.length === 4 ? p[0] + '.' + p[1] + '.' + p[2] + '.0/24' : String(ip);
 }
 
 // 服务端按 /24 加白：任一侧是 /24 段时比较前三段，否则要求完全相同
@@ -372,9 +472,34 @@ function sameC24(a, b) {
   b = String(b);
   if (a === b) return true;
   if (!/\/24$/.test(a) && !/\/24$/.test(b)) return false;
-  const pa = a.replace('/24', '').split('.');
-  const pb = b.replace('/24', '').split('.');
-  return pa.length === 4 && pb.length === 4 && pa[0] === pb[0] && pa[1] === pb[1] && pa[2] === pb[2];
+  return c24(a) === c24(b);
+}
+
+// 网段来源记录只留 30 天、最多 50 条
+function loadSrc() {
+  const m = loadJson(KEY_FW_SRC) || {};
+  const cutoff = Date.now() - 30 * 24 * 3600e3;
+  const keys = Object.keys(m)
+    .filter((k) => m[k] && m[k].ts > cutoff)
+    .sort((a, b) => m[b].ts - m[a].ts)
+    .slice(0, 50);
+  const out = {};
+  keys.forEach((k) => (out[k] = m[k]));
+  return out;
+}
+
+function mask(token) {
+  return token.length > 10 ? token.slice(0, 10) + '…' : token;
+}
+
+function cut(s, n) {
+  s = String(s);
+  return s.length > n ? s.slice(0, n) + '…' : s;
+}
+
+// 全角 ＠ ０-９ ，等转半角，中文输入法下也能填对
+function toHalfWidth(s) {
+  return s.replace(/[！-～]/g, (ch) => String.fromCharCode(ch.charCodeAt(0) - 0xfee0)).replace(/　/g, ' ');
 }
 
 /* ------------------------------------------------------------------ */
